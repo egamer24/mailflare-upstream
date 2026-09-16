@@ -88,6 +88,8 @@ export type FilterCondition = {
 	subject?: string;
 	body?: string;
 	hasAttachment?: boolean;
+	/** `[name]` matches messages carrying the header; `[name, value]` those whose value equals it. */
+	header?: string[];
 };
 
 export type FilterOperator = { operator: "AND" | "OR" | "NOT"; conditions: Filter[] };
