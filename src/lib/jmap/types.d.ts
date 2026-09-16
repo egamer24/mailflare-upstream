@@ -20,6 +20,9 @@ export type JmapResponse = {
 
 export type JmapMethodError = { type: string; description?: string; [key: string]: unknown };
 
+/** RFC 8620 §5.3 SetError: why one object in a /set or /import call was rejected. */
+export type JmapSetError = { type: string; properties?: string[]; description?: string };
+
 export type JmapContext = {
 	env: CloudflareEnv;
 	db: AppDatabase;
