@@ -6,6 +6,7 @@ import { getAuthorizedSenderAddress } from "@/lib/email/sender";
 import { joinEmailAddressList } from "@/lib/email/address";
 import { resolveThreadId } from "@/lib/email/threading";
 import { storeMessageAttachments } from "@/lib/email/attachments";
+import { deleteMessageWithObjects } from "@/lib/email/message-cleanup";
 import { LIMITS, KEYWORD_FLAGGED, KEYWORD_SEEN } from "./constants";
 import { JmapError, invalidArguments } from "./errors";
 import { decodeBlobId, decodeMailboxRef, roleToStatus } from "./ids";
@@ -319,7 +320,7 @@ export const emailSet: JmapMethodHandler = async (ctx, args) => {
 			notDestroyed[id] = { type: "forbidden" };
 			continue;
 		}
-		if (row.status === "trash" || row.status === "draft") await ctx.db.delete(messages).where(eq(messages.id, id));
+		if (row.status === "trash" || row.status === "draft") await deleteMessageWithObjects(ctx.env, ctx.db, row.id, row.rawR2Key);
 		else await ctx.db.update(messages).set({ status: "trash", folderId: null }).where(eq(messages.id, id));
 		destroyed.push(id);
 	}
@@ -393,12 +394,21 @@ async function importEmail(ctx: JmapContext, value: Record<string, unknown>, wri
 		await ctx.db.update(messages).set({ rawR2Key }).where(eq(messages.id, id));
 		if (parsed.attachments.length) await storeMessageAttachments(ctx.env, id, parsed.attachments);
 	} catch (error) {
-		await ctx.db.delete(messages).where(eq(messages.id, id));
-		if (rawR2Key) await ctx.env.BUCKET.delete(rawR2Key);
+		try {
+			await deleteMessageWithObjects(ctx.env, ctx.db, id, rawR2Key);
+		} catch (cleanupError) {
+			console.error(`Failed to clean up rejected Email/import draft ${id}`, cleanupError);
+		}
 		return { error: { type: "tooLarge", description: error instanceof Error ? error.message : "Attachments rejected" } };
 	}
 	// The bytes belong to the message now, so release the upload.
-	await deleteUpload(ctx, blob.id);
+	try {
+		await deleteUpload(ctx, blob.id);
+	} catch (error) {
+		// The import is already complete. Failing it here would make a client retry
+		// and create a duplicate draft merely because temporary cleanup failed.
+		console.warn(`Failed to delete claimed JMAP upload ${blob.id}`, error);
+	}
 	return { id };
 }
 
