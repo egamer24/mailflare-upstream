@@ -1,0 +1,103 @@
+name: Database Migrate
+
+# Not an upstream workflow. This fork is the UPDATE_SOURCE_REPOSITORY for the
+# egamer24/mailflare installation, so anything committed here is carried into
+# that repository by every "Update Mailflare" run -- which is the point: a
+# workflow living in the installation repo alone would be deleted by the very
+# update that makes it necessary.
+#
+# Why it exists: the updater used to run `wrangler d1 migrations apply` itself,
+# and the 2026-09-18 rewrite dropped that step. Cloudflare Workers Builds
+# deploys on push, so an update ships new code the moment the updater pushes,
+# before any migration has run. When a release adds columns the new code reads,
+# that gap breaks the app -- migration 0031 added columns to `users`, and both
+# the login route and the session lookup issue a bare select() over that table,
+# so every auth request fails until the migration lands.
+#
+# This workflow talks to D1 directly and needs no application session, so it
+# still works when nobody can log in. CLOUDFLARE_API_TOKEN needs only D1
+# access; it deliberately does not deploy, and does not need Workers scope.
+#
+# Run `verify` after any update. Run `migrate` when it reports pending work,
+# or immediately if an update left the app broken.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Which phase to run"
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - migrate
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Check Cloudflare credentials
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID must be repository Actions secrets."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pending migrations
+        run: npx wrangler d1 migrations apply DB --remote --dry-run || npx wrangler d1 migrations list DB --remote
+
+      # `d1_migrations` records what was registered, which is not always what
+      # was run: the old setup path inserted migration names without executing
+      # them. Probe the schema itself rather than trusting that table.
+      - name: Inspect real schema
+        if: inputs.phase == 'verify'
+        run: |
+          set -euo pipefail
+          echo "--- most recently registered migrations ---"
+          npx wrangler d1 execute DB --remote --command \
+            "SELECT name FROM d1_migrations ORDER BY id DESC LIMIT 8;"
+          echo "--- schema object counts ---"
+          npx wrangler d1 execute DB --remote --command \
+            "SELECT type, COUNT(*) AS count FROM sqlite_master GROUP BY type ORDER BY type;"
+          echo "--- search index health (indexed should equal messages) ---"
+          npx wrangler d1 execute DB --remote --command \
+            "SELECT (SELECT COUNT(*) FROM messages) AS messages, (SELECT COUNT(*) FROM messages_fts) AS indexed;"
+
+      # Recorded before anything is written, so there is a restore target
+      # without exporting message bodies out of Cloudflare. D1 Time Travel
+      # keeps 30 days; note that `wrangler d1 export` stops working once the
+      # messages_fts virtual table exists, so this is the backup that works.
+      - name: Record Time Travel bookmark
+        if: inputs.phase == 'migrate'
+        run: |
+          set -euo pipefail
+          echo "Restore point for this run -- keep this bookmark:"
+          npx wrangler d1 time-travel info DB
+
+      - name: Apply migrations
+        if: inputs.phase == 'migrate'
+        run: npx wrangler d1 migrations apply DB --remote
+
+      - name: Confirm migrations applied
+        if: inputs.phase == 'migrate'
+        run: npx wrangler d1 migrations apply DB --remote --dry-run || npx wrangler d1 migrations list DB --remote
